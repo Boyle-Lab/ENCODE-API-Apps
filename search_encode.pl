@@ -24,6 +24,7 @@ use WWW::Mechanize;
 use Getopt::Long;
 use Encode qw(encode_utf8 decode_utf8);
 use Digest::MD5 qw(md5_hex);
+use URI::Escape;
 
 my $usage =
 "\nsearch_encode.pl
@@ -44,8 +45,9 @@ search_encode.pl <search term> <params string> [OPTIONS]
 <params string>
     Comma-delimited sting of key:value pairs corresponding to columns in the
     given database table. See the schema at the address above. Some columns
-    have sub-keys that can be searched. See the supplemental table SX at
-    http://address_for_supplement.com/supplement.xls for a listing.
+    have sub-keys that can be searched. Some examples are available in Box 3:
+    API Resources, in \"Deciphering ENCODE\", available at
+    http://www.cell.com/trends/genetics/fulltext/S0168-9525%2816%2900017-2
     
     Possible keys of interest for experiments:
         biosample_term_name: tissue/cell used in assay
@@ -93,11 +95,30 @@ OPTIONS:
 --out-root <root>
     String to prepend to output files.
 
+--check-exists
+    Check to see if a file already exists before downloading and do not
+    retrieve if found.
+
 --save-json
     Save the JSON metadata for every file downloaded. This can be useful for
     identifying individual files and properties later on when retrieving
     multiple files, especially if further programmatic processing is
     anticipated.
+
+--no-header
+    Do not print a header line with column names to the metadata file.
+
+--count-only
+    Return only the number of results for the search. Do not retrieve
+    any metadata or files. Suppresses --download (and related options) and
+    --save-json.
+
+--by-biosample
+    Convert the search term to a biosample term name, for which search
+    results will be returned. The search term is not directly queried with
+    this option, but rather converted into a search parameter. This can be
+    useful when a search for a specific cell line is yielding either no
+    results or imprecise results.
 
 --help
     Display this message
@@ -194,6 +215,10 @@ my $download_path = "";
 my $out_root = "";
 my $save_json = 0;
 my $rec_type = "experiment";
+my $no_header = 0;
+my $count_only = 0;
+my $by_biosample = 0;
+my $check_exists = 0;
 
 GetOptions (
     "help" => \$help,
@@ -204,7 +229,11 @@ GetOptions (
     "download-path=s" => \$download_path,
     "out-root=s" => \$out_root,
     "save-json" => \$save_json,
-    "rec-type=s" => \$rec_type
+    "rec-type=s" => \$rec_type,
+    "no-header" => \$no_header,
+    "count-only" => \$count_only,
+    "by-biosample" => \$by_biosample,
+    "check-exists" => \$check_exists
     );
 
 # Check for proper usage and help option and exit with usage message as needed.
@@ -227,6 +256,9 @@ if ($download && !defined($output_type_str)) {
 }
 if ($rec_type ne "experiment") {
     print STDERR "\nWarning: --rec_type other than \"experiment\" has not been well tested and may produces unpredictable results!\n";
+}
+if ($count_only && $download) {
+    print STDERR "\nWarning: --count-only overrides --download. No data will be retrieved! (see --help if this is not what you want)\n";
 }
 
 # Check the download path for a trailing slash and add one if needed
@@ -265,17 +297,43 @@ my $mech = WWW::Mechanize->new(
         # Quick and dirty hack to avoid errors about missing SSL certificates.
     },
     );
+# Set the history stack depth to 0 -- prevents memory usage from getting out of
+# hand for large queries.
+$mech->stack_depth( 0 );
 
 ####################
 # Stage 1: Build the query URL and run the primary query against the ENCODE
 # Portal.
 
+my $URL;
+
+# Handle biosample-based queries with a preliminary query to get the
+# biosample term name based on the search term.
+my $biosample;
+if ($by_biosample) {
+    print STDERR "\nSearching ENCODE for a biosample matching $search_str...\n";
+    $biosample = &get_biosample($mech, $search_str);
+    if (!defined($biosample)) {
+	die "Cannot find a biosample matching $search_str!\n";
+    }
+    $search_str = "*";
+    $biosample = uri_escape($biosample);
+} else {
+    # Escape special characters in the search string
+    $search_str = uri_escape($search_str);
+}
+
 # Build the query URL from the command line args and parameters
-my $URL = 'http://www.encodeproject.org/search/?searchTerm=';
+$URL = 'http://www.encodeproject.org/search/?searchTerm=';
 $URL .= $search_str;
 $URL .= "&type=";
 $URL .= $rec_type;
 $URL .= $params;
+
+if (defined($biosample)) {
+    $URL .= "&biosample_term_name=";
+    $URL .= $biosample;
+}
 
 # &limit=all: Return all results, not just the first 25
 # &frame=object: Return all non-null fields within the JSON data for results
@@ -290,6 +348,15 @@ my $json = &get_json($mech, $URL);
 # Print status and result count to the terminal
 print STDERR "${$json}{notification}: ${$json}{total} results found.\n\n";
 
+if ($count_only) {
+    print "${$json}{total}\n";
+    exit 0;
+}
+
+# Catch requests that returned an error status from the Portal
+if ( ${$json}{error_status} ) {
+    exit 1;
+}
 
 #####################
 # Stage Two: Find the files we need within the search results.
@@ -364,6 +431,10 @@ foreach my $row (@{${$json}{'@graph'}}) {
 			   $result{date_released}, &nopath($result{lab}),
 			   $result{accession}, $controls_str, $documents_str);
 		push @metadata, \@row;
+	    } else {
+		# Should  not be necessary, but just to be sure there's no json
+		# hanging around for files we're not using.
+		undef($file_json);
 	    }
 	}
 	
@@ -414,14 +485,16 @@ if ($download) {
 	       "documents");
 }
 
-&print_array(\@header, "\t", $DATA);
+unless ($no_header) {
+    &print_array(\@header, "\t", $DATA);
+}
 
 # Download the files
 if ($download) {
     print STDERR "Downloading $n_results files from ${$json}{total} records...\n";
 }
 foreach my $file_json (@downloads) {
-    &download_file($mech, $file_json, $download_path, $out_root);
+    &download_file($mech, $file_json, $download_path, $out_root, $check_exists);
     if ($save_json) {
 	&save_json($file_json, $download_path, $out_root);
     }
@@ -450,8 +523,22 @@ sub get_json {
     # Retrieve JSON data from a URL and return it as a data structure.
     my $mech = $_[0];
     my $url = $_[1];
-    $mech->get($url);
-    my $json = decode_json($mech->content);
+
+    my $status = eval {
+	$mech->get($url);
+	1
+    };
+
+    my $content;
+    if (!$status) {
+	# For some reason, the portal sometimes returns an error when there
+	# are no results. In these cases, use a dummy json to notify the user.
+	$content = '{ "notification": "ENCODE Portal returned error status: no results or bad request. Please check your query for errors!", "total": 0, "error_status": 1 }';
+    } else {
+	$content = $mech->content;
+    }
+
+    my $json = decode_json($content);
     return $json;
 }
 
@@ -475,6 +562,7 @@ sub download_file {
     my $json = $_[1];
     my $download_path = $_[2];
     my $out_root = $_[3];
+    my $check_exists = $_[4];
 
     my $url = "https://www.encodeproject.org" . ${$json}{href};
     print STDERR "Found a matching record at $url. Retrieving data...\n";
@@ -488,8 +576,21 @@ sub download_file {
     } else {
 	# Checksums match. Save file to the specified
 	# path and file name.
-	my $outfile = $download_path . $out_root . '.' . ${$json}{accession} . '.'
-	    . ${$json}{file_format};
+
+        # This leaves off the .gz in names of zipped files!
+	#my $outfile = $download_path . $out_root . '.' . ${$json}{accession} . '.'
+	#    . ${$json}{file_format};
+
+	my @file_parts = split /\//, ${$json}{href};
+
+        my $outfile = $download_path . $out_root . '.' . $file_parts[$#file_parts];
+
+	if ($check_exists && -f $outfile) {
+	    # See if file already exists and move on if found
+	    print STDERR "\tFile exists: $outfile. Moving on...\n";
+	    return 1;
+	}
+
 	$outfile =~ s/^\.//;
 	print STDERR "\tSaving file to $outfile...\n";
 	$mech->save_content($outfile);
@@ -533,4 +634,59 @@ sub nopath {
     $str =~ s/\/$//;
     $str =~ s/\/\S+\///;
     return $str;
+}
+
+sub get_biosample {
+    my ($mech, $search_str) = @_;
+
+    my $URL = 'http://www.encodeproject.org/search/?searchTerm=';
+    $URL .= $search_str;
+    $URL .= "&type=biosample";
+    $URL .= '&limit=all&frame=object&format=json';
+    
+#    print STDERR "$URL\n";
+
+    my $json = &get_json($mech, $URL);
+
+    if ( ${$json}{error_status} ) {
+	return undef;
+    }
+
+    my %terms_hash;
+    foreach my $row (@{${$json}{'@graph'}}) {
+	$terms_hash{${$row}{biosample_term_name}}++;
+    }
+
+    if (!%terms_hash) {
+	return undef;
+    }
+
+    my @terms;
+    foreach my $key (keys(%terms_hash)) {
+	my @tmp = ($key, $terms_hash{$key});
+	push @terms, \@tmp;
+    }
+
+    my $biosample;
+    if ($#terms > 0) {
+	print STDERR "More than one possible biosample found...\n\n";
+	for (my $i = 0; $i <= $#terms; $i++) {
+	    print STDERR $i+1, ": $terms[$i][0] ($terms[$i][1] occurences)\n";
+	}
+	print STDERR "\nEnter the number of the term you want to use [1] : ";
+	my $idx = <STDIN>;
+	if ($idx eq '') {
+	    $idx = 1;
+	}
+	chomp $idx;
+	$idx--;
+
+	$biosample = $terms[$idx][0];
+
+    } else {
+	$biosample = $terms[0][0];
+    }
+    
+    print STDERR "Using \"$biosample\" as biosample term name.\n\n";
+    return $biosample;
 }
